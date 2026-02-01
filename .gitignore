@@ -47,3 +47,9 @@ __pycache__/
 
 # virtualenv
 venv/
+
+# snapshots / backups
+*.snap_*
+*.bak
+*.backup
+*_backup_*
