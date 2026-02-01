@@ -28,3 +28,22 @@ venv/
 # python bytecode (혹시 빠졌을 때 대비)
 *.pyc
 __pycache__/
+
+# secrets / env
+.env
+service_account.json
+bot_state.json
+*.key
+*.pem
+
+# logs
+*.log
+updater.log
+bot_errors.log
+
+# python caches
+__pycache__/
+*.pyc
+
+# virtualenv
+venv/
