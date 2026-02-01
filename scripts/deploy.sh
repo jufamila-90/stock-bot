@@ -1,19 +1,24 @@
 #!/bin/bash
 # scripts/deploy.sh
-# Run on Local Check: Automates deployment to VM
+# Run on Local: Automates deployment to VM with strict verification
 #
 # Usage: ./scripts/deploy.sh
 
 set -euo pipefail
 
 # --- Configuration ---
+# SSH Connection User (User with valid SSH key)
+SSH_USER="juhyeon" 
+# Target Service User (User running the bot)
+VM_USER="jufamila"
 VM_HOST="34.16.2.223"
-VM_USER="juhyeon"          # SSH connection user (key registered)
-TARGET_USER="jufamila"     # Actual bot execution user
-REMOTE_DIR="/home/$TARGET_USER/stock-bot"
+REMOTE_DIR="/home/$VM_USER/stock-bot"
 TMUX_SESSION="stock-bot"
 SSH_KEY="~/.ssh/google_compute_engine"
-SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no $VM_USER@$VM_HOST"
+
+# SSH Command Definition
+# We connect as SSH_USER, but run commands as VM_USER using sudo
+SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no $SSH_USER@$VM_HOST"
 
 # ANSI Colors
 RED='\033[0;31m'
@@ -22,11 +27,10 @@ YELLOW='\033[1;33m'
 PC='\033[0;36m' # Primary Color
 NC='\033[0m' # No Color
 
-# Helper to run command as target user
-run_as_target() {
+# Helper helper to run command as target user
+run_remote() {
     local CMD="$1"
-    # Execute as target user using sudo
-    $SSH_CMD "sudo -u $TARGET_USER bash -c '$CMD'"
+    $SSH_CMD "sudo -u $VM_USER bash -c '$CMD'"
 }
 
 log_step() {
@@ -42,97 +46,92 @@ log_success() {
 }
 
 echo "========================================"
-echo "🚀 Stock Bot Deployment"
-echo "   Target: $TARGET_USER@$VM_HOST ($REMOTE_DIR)"
+echo "🚀 Stock Bot Deployment System"
+echo "   Target: $VM_USER@$VM_HOST"
 echo "========================================"
 
-# 1. Local Git Check
-log_step "Checking local repository status..."
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$BRANCH" != "main" ]; then
-    echo -e "${YELLOW}⚠️  Current branch is '$BRANCH', not 'main'.${NC}"
-    read -p "Continue anyway? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log_error "Aborted by user."
-        exit 1
+# A. git check
+if [ ! -d ".git" ]; then
+    log_error "This script must be run from the repository root."
+    exit 1
+fi
+
+# B. Branch check
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    echo -e "${YELLOW}⚠️  Current branch is '$CURRENT_BRANCH' (Expected: main)${NC}"
+    echo "   Press any key to continue, or Ctrl+C to abort..."
+    read -n 1 -s
+fi
+
+# Git status check
+if [[ -n $(git status -s) ]]; then
+    echo -e "${YELLOW}⚠️  You have uncommitted changes.${NC}"
+    git status -s
+    echo "   Deploying only committed code..."
+fi
+
+# C. Push
+log_step "Pushing to origin/main..."
+git push origin main
+
+# D. Remote Execution
+log_step "Connecting to VM for updates..."
+
+# d-1. Pull
+run_remote "cd $REMOTE_DIR && git pull --ff-only origin main"
+
+# d-2. Venv setup
+run_remote "cd $REMOTE_DIR && [ ! -d venv ] && python3 -m venv venv || true"
+
+# d-3. Pip install
+log_step "Updating dependencies..."
+run_remote "cd $REMOTE_DIR && ./venv/bin/pip install -U pip && ./venv/bin/pip install -r requirements.txt"
+
+# d-4. Verification (30s)
+log_step "Running 30s verification test..."
+# Ignoring timeout exit code (124)
+run_remote "cd $REMOTE_DIR && timeout 30s ./venv/bin/python -u main.py > /tmp/bot_verify.log 2>&1 || [ \$? -eq 124 ]"
+
+# Retrieve logs for analysis
+log_step "Analyzing logs..."
+LOG_CONTENT=$($SSH_CMD "sudo cat /tmp/bot_verify.log")
+
+PASSED=0
+
+# Success Checks
+if echo "$LOG_CONTENT" | grep -q "✅ Gemini Model Initialized:"; then
+    if echo "$LOG_CONTENT" | grep -E "✅ 구글 시트 연결 완료|✅ spreadsheet open OK|✅ SHEET_APPEND_OK"; then
+        PASSED=1
     fi
 fi
 
-if [[ -n $(git status -s) ]]; then
-    echo -e "${YELLOW}⚠️  You have uncommitted changes.${NC}"
-    # By default continue, but warn
-    git status -s
-    echo "   (Deploying only committed code)"
+# Failure Checks
+if echo "$LOG_CONTENT" | grep -E "404 models/|is not found for API version"; then
+    log_error "Gemini Model 404 Error Detected"
+    PASSED=0
 fi
-
-log_step "Pushing changes to origin/main..."
-git push origin main || { log_error "Git push failed"; exit 1; }
-
-# 2. Remote Update
-log_step "Updating code on VM..."
-run_as_target "cd $REMOTE_DIR && git pull --ff-only origin main" || { log_error "Remote git pull failed"; exit 1; }
-
-# 3. Dependency Check
-log_step "Checking dependencies (venv & pip)..."
-run_as_target "cd $REMOTE_DIR && [ ! -d venv ] && python3 -m venv venv || true"
-run_as_target "cd $REMOTE_DIR && ./venv/bin/python -m pip install -r requirements.txt" || { log_error "Pip install failed"; exit 1; }
-
-# 4. Permissions
-log_step "Updating script permissions..."
-run_as_target "chmod +x $REMOTE_DIR/scripts/*.sh"
-
-# 5. Verification Run (30s)
-log_step "Running 30s Verification Test..."
-# Ignore exit code 124 (timeout) but fail on others
-run_as_target "cd $REMOTE_DIR && timeout 30s ./venv/bin/python -u main.py > /tmp/bot_deploy_verify.log 2>&1 || [ \$? -eq 124 ]"
-
-# Analyze Log
-log_step "Analyzing verification logs..."
-LOG_CONTENT=$($SSH_CMD "sudo cat /tmp/bot_deploy_verify.log")
-
-FAILED=0
-
-# Critical Checks
-if echo "$LOG_CONTENT" | grep -q "Gemini Model Initialized"; then
-    log_success "Gemini Verified"
-else
-    log_error "Gemini Init NOT found"
-    FAILED=1
-fi
-
-if echo "$LOG_CONTENT" | grep -E "✅ .*시트 연결|✅ spreadsheet open OK|✅ 구글 시트 연결 완료"; then
-    log_success "Google Sheet Connected"
-else
-    log_error "Google Sheet Connection NOT found"
-    FAILED=1
-fi
-
-if echo "$LOG_CONTENT" | grep -q "404 models/"; then
-    log_error "Model 404 Error Detected"
-    FAILED=1
-fi
-
 if echo "$LOG_CONTENT" | grep -q "403 Your API key was reported as leaked"; then
-    log_error "API Key Leaked (403) Error Detected"
-    FAILED=1
+    log_error "Gemini API Key Leaked (403)"
+    PASSED=0
+fi
+if echo "$LOG_CONTENT" | grep -q "No such file or directory: 'service_account.json'"; then
+    log_error "Service Account JSON missing"
+    PASSED=0
 fi
 
-if [ $FAILED -eq 1 ]; then
-    log_error "Deploy Verification FAILED. Last 80 lines of log:"
+if [ $PASSED -eq 1 ]; then
+    log_success "Verification Passed!"
+else
+    log_error "Verification Failed! Last 120 lines:"
     echo "---------------------------------------------------"
-    echo "$LOG_CONTENT" | tail -n 80
+    echo "$LOG_CONTENT" | tail -n 120
     echo "---------------------------------------------------"
     exit 1
 fi
 
-log_success "Verification Passed!"
+# E. Restart
+log_step "Restarting Bot..."
+run_remote "cd $REMOTE_DIR && ./scripts/restart_bot.sh"
 
-# 6. Restart Service
-log_step "Restarting Bot Service..."
-run_as_target "cd $REMOTE_DIR && ./scripts/restart_bot.sh"
-
-echo "========================================"
-log_success "Deployment Complete Success!"
-echo "   Monitor: $SSH_CMD 'sudo -u $TARGET_USER tmux attach -t $TMUX_SESSION'"
-echo "========================================"
+log_success "Deployment Complete!!"
