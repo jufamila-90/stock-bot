@@ -1,0 +1,1903 @@
+import os, time, json, re, datetime
+import concurrent.futures
+from io import StringIO
+
+import pytz
+import schedule
+import feedparser
+import requests
+import pandas as pd
+import yfinance as yf
+import gspread
+import FinanceDataReader as fdr
+
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+
+import google.generativeai as genai
+try:
+    from gspread_formatting import *  # noqa
+    HAS_GSPREAD_FORMATTING = True
+except Exception as e:
+    HAS_GSPREAD_FORMATTING = False
+    print(f"⚠️ gspread_formatting 비활성화: {e}")
+
+# ==============================================================================
+# V33.1 (Radar + KIS US Trading + Latency Guard)
+# - KR/US 24시간 정보 수집(뉴스 + 레이더)
+# - 시장 열리면 자동매매 실행
+# - 주문 직전 KIS 현재가로 교차검증(딜레이 방어)
+# ==============================================================================
+
+VERSION = "V33.1 (Radar+KIS-US+LatencyGuard)"
+
+TZ_KR = pytz.timezone("Asia/Seoul")
+TZ_ET = pytz.timezone("America/New_York")
+
+STATE_FILE = "bot_state.json"
+SERVICE_ACCOUNT_FILE = "service_account.json"
+
+# 구글시트: 이름(open) 대신 ID(open_by_key)로 고정 가능
+SPREADSHEET_NAME = "AI_Trading_Journal_NEW"  # fallback
+SPREADSHEET_ID = ""   # .env 로드 후 세팅
+WS_TRADES = "주식내역"
+WS_AI_LOG = "AI_검증_기록"
+WS_DASHBOARD = "Dashboard"
+
+# ----------------------------
+# .env 로드
+# ----------------------------
+load_dotenv()
+
+
+# --- Sheet heartbeat (runtime write check) ---
+LAST_SHEET_HEARTBEAT = 0
+SHEET_HEARTBEAT_SEC = int(os.getenv("SHEET_HEARTBEAT_SEC", "180"))
+
+def sheet_heartbeat():
+    """WS_AI_LOG에 주기적으로 'alive' 기록. (운영에서 필수)"""
+    global LAST_SHEET_HEARTBEAT
+    if not GSHEET:
+        return
+    try:
+        import time
+        now = time.time()
+        if now - LAST_SHEET_HEARTBEAT < SHEET_HEARTBEAT_SEC:
+            return
+        LAST_SHEET_HEARTBEAT = now
+        ts = now_kr().strftime("%Y-%m-%d %H:%M:%S")
+        ws = GSHEET.worksheet(WS_AI_LOG)
+        safe_append_row(ws, [ts, "SYS", "HEARTBEAT", "alive"], value_input_option="USER_ENTERED", ctx="HEARTBEAT")
+        print("✅ HEARTBEAT appended")
+    except Exception as e:
+        print(f"⚠️ HEARTBEAT 실패: {e}")
+
+GEMINI_KEY = os.getenv("GEMINI_KEY", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+
+# --- Google Sheet 고정(권장) ---
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+WS_TRADES = os.getenv("WS_TRADES", "주식내역")
+WS_AI_LOG = os.getenv("WS_AI_LOG", "AI_검증_기록")
+WS_DASHBOARD = os.getenv("WS_DASHBOARD", "Dashboard")
+
+KIS_APP_KEY = os.getenv("KIS_APP_KEY", "")
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
+KIS_CANO = os.getenv("KIS_CANO", "")
+KIS_ACNT_PRDT_CD = os.getenv("KIS_ACNT_PRDT_CD", "01")
+
+KIS_ENV = os.getenv("KIS_ENV", "VIRTUAL").upper()  # VIRTUAL / REAL
+KIS_DOMAIN_REAL = os.getenv("KIS_DOMAIN_REAL", "https://openapi.koreainvestment.com:9443")
+KIS_DOMAIN_VIRTUAL = os.getenv("KIS_DOMAIN_VIRTUAL", "https://openapivts.koreainvestment.com:29443")
+
+
+# ===== SHEET APPEND RETRY WRAPPER =====
+def safe_append_row(ws, row, value_input_option="USER_ENTERED", tries=4, base_sleep=0.8, ctx=""):
+    """
+    Google Sheet append_row 재시도 래퍼.
+    - 일시적 429/5xx/timeout 등에 대비
+    - tries: 총 시도 횟수
+    - base_sleep: 첫 대기(초) / 이후 지수 백오프
+    """
+    import time
+    last_err = None
+    for i in range(1, tries + 1):
+        try:
+            ws.append_row(row, value_input_option=value_input_option)
+            if ctx:
+                print(f"✅ SHEET_APPEND_OK ({ctx})")
+            return True
+        except Exception as e:
+            last_err = e
+            wait = base_sleep * (2 ** (i - 1))
+            print(f"⚠️ SHEET_APPEND_FAIL ({ctx}) try={i}/{tries} err={e} -> sleep {wait:.1f}s")
+            time.sleep(wait)
+    print(f"❌ SHEET_APPEND_GIVEUP ({ctx}) last_err={last_err}")
+    return False
+
+def kis_domain() -> str:
+    return KIS_DOMAIN_VIRTUAL if KIS_ENV == "VIRTUAL" else KIS_DOMAIN_REAL
+
+# ==============================================================================
+# 리스크/운영 파라미터
+# ==============================================================================
+# 거래 모드:
+# - DRY_RUN=True : 주문 API 호출 자체를 안 함(완전 모의)
+# - DRY_RUN=False & KIS_ENV=VIRTUAL : KIS 모의투자 계좌로 "진짜 주문" 호출(권장 테스트)
+# - DRY_RUN=False & KIS_ENV=REAL : 실전 주문
+DRY_RUN = False
+
+MAX_POSITIONS = 6
+MAX_RETRIES_PER_DAY = 3
+
+# 손익/리스크
+MAX_DAILY_LOSS_KRW = -500000
+STOP_LOSS_PCT = -0.05
+TAKE_PROFIT_PCT = 0.15
+
+# 자금/비중
+VIRTUAL_CASH_KRW = 10_000_000
+USE_EQUITY_RATIO = False
+INVEST_PER_TRADE_KRW = 1_000_000
+EQUITY_RATIO_PER_TRADE = 0.05
+
+MIN_TRADE_KRW = 500_000
+MAX_TRADE_KRW = 3_000_000
+MAX_TRADE_PCT = 0.10
+
+SCALING_BUY_STEPS = [0.3, 0.3, 0.4]
+SCALING_SELL_STEPS = [0.5, 0.5]
+
+# 유동성 필터
+MIN_VOLUME_KRW = 1_400_000_000  # 14억
+
+# 지연 방어(교차검증)
+# - YF 분석가 vs KIS 실시간가 괴리(%)가 이 값 이상이면 주문 취소/축소
+LATENCY_GUARD_SOFT = 0.007   # 0.7% 이상이면 경고 + KIS가로 교체
+LATENCY_GUARD_HARD = 0.02    # 2.0% 이상이면 주문 스킵
+
+# 환율
+EXCHANGE_RATE = 1450.0
+
+# ==============================================================================
+# 전역 상태
+# ==============================================================================
+ACCESS_TOKEN = ""
+ACCESS_TOKEN_EXPIRES_AT = 0  # epoch seconds
+
+GSHEET = None
+
+SEEN_LINKS = {}  # {link: last_seen_epoch}
+SEEN_TTL_SEC = 60 * 60 * 48  # 48시간
+
+KR_TICKER_MAP = {}  # name/code -> 005930.KS / .KQ
+
+PORTFOLIO = {}  # {ticker: {qty, avg_price, market, step, half_sold, trade_type, exch}}
+TODAY_PROFIT_KRW = 0
+DAILY_TRADE_COUNT = {}
+LAST_RESET_DATE = None
+
+# 장이 닫혀도 "좋은 시그널"을 적재했다가, 장 열리면 실행
+PENDING_SIGNALS = []  # list of {ts, market, ticker, score, reason, trade_type, exch}
+MAX_PENDING_SIGNALS = int(os.getenv("MAX_PENDING_SIGNALS", "200"))  # pending 상한
+
+
+# ==============================================================================
+# [V40 PATCH] Observability + Proportional Sizing + Vol Targeting
+# - (V33.1 병목 해결) OB 하드필터 때문에 매수 0이 되는 문제를 '소프트 스코어'로 완화
+# - (책 핵심 반영) 점수 기반 비례배분 + (US) 변동성 타겟팅 + 이중 손절(절반/전량)
+# - (운영 핵심) 왜 매수가 안 됐는지 DROP 사유를 집계/샘플로 출력
+# ==============================================================================
+from collections import defaultdict, deque
+
+OBS = {
+    "kpi": defaultdict(int),
+    "drop": defaultdict(int),
+    "samples": defaultdict(lambda: deque(maxlen=5)),
+    "last_print": 0,
+}
+OBS_PRINT_INTERVAL_SEC = 180  # 3분
+
+def obs_inc(key: str, n: int = 1):
+    OBS["kpi"][key] += n
+
+def obs_drop(reason: str, market=None, ticker=None, score=None, extra=None):
+    OBS["drop"][reason] += 1
+    OBS["samples"][reason].append({
+        "m": market,
+        "t": ticker,
+        "s": score,
+        "x": extra if extra is not None else {},
+    })
+
+def obs_maybe_print():
+    now = time.time()
+    if now - OBS["last_print"] < OBS_PRINT_INTERVAL_SEC:
+        return
+    OBS["last_print"] = now
+
+    top = sorted(OBS["drop"].items(), key=lambda x: x[1], reverse=True)[:10]
+    print("📊 [KPI]", dict(OBS["kpi"]))
+    print("🧱 [DROP_TOP]", top)
+    for r, _ in top[:3]:
+        print(f"🧪 [SAMPLE {r}]", list(OBS["samples"][r])[-3:])
+
+
+def market_vol_proxy_us():
+    """QQQ 최근 20일 일간 변동성(표준편차)"""
+    try:
+        df = yf.Ticker("QQQ").history(period="2mo", interval="1d")
+        if df is None or df.empty or len(df) < 25:
+            return None
+        rets = df["Close"].pct_change().dropna()
+        return float(rets.tail(20).std())
+    except:
+        return None
+
+
+def vol_target_multiplier(market: str):
+    """변동성↑ -> 투자금↓ (US만 적용)"""
+    if market != "US":
+        return 1.0
+    target = 0.016  # 1.6%
+    vol = market_vol_proxy_us()
+    if not vol:
+        return 1.0
+    mult = target / vol
+    return max(0.4, min(1.2, mult))
+
+
+def calc_amount_proportional(soft_score: float, market: str):
+    """(책 반영) Proportional Rule + Vol Targeting"""
+    BUY_SCORE_MIN = 82
+    s = max(BUY_SCORE_MIN, min(100.0, float(soft_score)))
+    alpha = (s - BUY_SCORE_MIN) / (100.0 - BUY_SCORE_MIN)  # 0~1
+
+    base = MIN_TRADE_KRW + alpha * (MAX_TRADE_KRW - MIN_TRADE_KRW)
+    base *= vol_target_multiplier(market)
+
+    eq = calc_equity()
+    base = min(base, eq * MAX_TRADE_PCT, VIRTUAL_CASH_KRW)
+    base = max(base, MIN_TRADE_KRW)
+    return int(base)
+# ==============================================================================
+# Gemini
+# ==============================================================================
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel("gemini-2.0-flash-exp") if GEMINI_KEY else None
+
+# ==============================================================================
+# [1] 유틸
+# ==============================================================================
+def now_kr():
+    return datetime.datetime.now(TZ_KR)
+
+def now_et():
+    return datetime.datetime.now(TZ_ET)
+
+def send_telegram(msg: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ TELEGRAM 설정 없음")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=8
+        )
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 실패: {e}")
+
+def prune_seen_links():
+    cutoff = int(time.time()) - SEEN_TTL_SEC
+    dead = [k for k, v in SEEN_LINKS.items() if v < cutoff]
+    for k in dead:
+        del SEEN_LINKS[k]
+
+def safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except:
+        return default
+
+def safe_int(x, default=0):
+    try:
+        return int(float(x))
+    except:
+        return default
+
+# ==============================================================================
+# [2] 상태 저장/복원 (Persistence)
+# ==============================================================================
+def save_state():
+    global LAST_RESET_DATE
+    try:
+        data = {
+            "virtual_cash": VIRTUAL_CASH_KRW,
+            "portfolio": PORTFOLIO,
+            "today_profit": TODAY_PROFIT_KRW,
+            "daily_trade_count": DAILY_TRADE_COUNT,
+            "last_reset_date": LAST_RESET_DATE.isoformat() if LAST_RESET_DATE else None,
+            "seen_links": SEEN_LINKS,
+            "pending_signals": PENDING_SIGNALS,
+            "exchange_rate": EXCHANGE_RATE,
+            "kis_env": KIS_ENV,
+            "dry_run": DRY_RUN,
+        }
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ save_state 에러: {e}")
+
+def load_state():
+    global VIRTUAL_CASH_KRW, PORTFOLIO, TODAY_PROFIT_KRW, DAILY_TRADE_COUNT, LAST_RESET_DATE
+    global SEEN_LINKS, PENDING_SIGNALS, EXCHANGE_RATE
+    if not os.path.exists(STATE_FILE):
+        print("ℹ️ 저장된 상태 파일 없음 (처음 실행)")
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        VIRTUAL_CASH_KRW = data.get("virtual_cash", VIRTUAL_CASH_KRW)
+        PORTFOLIO = data.get("portfolio", {})
+        TODAY_PROFIT_KRW = data.get("today_profit", 0)
+        DAILY_TRADE_COUNT = data.get("daily_trade_count", {})
+        d = data.get("last_reset_date")
+        if d:
+            LAST_RESET_DATE = datetime.date.fromisoformat(d)
+        SEEN_LINKS = data.get("seen_links", {})
+        PENDING_SIGNALS = data.get("pending_signals", [])
+        EXCHANGE_RATE = safe_float(data.get("exchange_rate"), EXCHANGE_RATE)
+        print(f"✅ 상태 복원 완료 (가상현금: {int(VIRTUAL_CASH_KRW):,}원, 보유종목: {len(PORTFOLIO)}개, Pending: {len(PENDING_SIGNALS)}개)")
+    except Exception as e:
+        print(f"⚠️ load_state 에러: {e}")
+
+# ==============================================================================
+# [3] 구글 시트 로그
+# ==============================================================================
+def initialize_sheet():
+    global GSHEET
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
+        client = gspread.authorize(creds)
+
+        # ✅ 이름 대신 ID로 고정 (가장 안전)
+        if SPREADSHEET_ID:
+            GSHEET = client.open_by_key(SPREADSHEET_ID)
+        else:
+            GSHEET = client.open(SPREADSHEET_NAME)
+
+        # ✅ 기존 탭 확인 및 헤더 서식 적용
+        try:
+            ws_ai = GSHEET.worksheet(WS_AI_LOG)
+            format_sheet_headers(ws_ai)
+        except Exception as e:
+            print(f"⚠️ AI_LOG 탭 서식 적용 실패: {e}")
+        
+        try:
+            ws_trades = GSHEET.worksheet(WS_TRADES)
+            format_sheet_headers(ws_trades)
+        except Exception as e:
+            print(f"⚠️ TRADES 탭 서식 적용 실패: {e}")
+        
+        # ✅ Dashboard 탭 생성 (없으면 자동 생성)
+        create_dashboard_tab()
+
+        print("✅ 구글 시트 연결 완료 (프로페셔널 서식 적용)")
+    except Exception as e:
+        GSHEET = None
+        print(f"⚠️ 시트 연결 실패: {e}")
+
+def log_ai_thought(market, ticker, score, status, trade_type, reason, source="", yf_price=None, kis_price=None, gap=None, note="", ctx_tag="AI_LOG"):
+
+    if not GSHEET:
+        return
+    try:
+        ts = now_kr().strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            ts, market, ticker, score, status, trade_type, reason, source, note,
+            "" if yf_price is None else yf_price,
+            "" if kis_price is None else kis_price,
+            "" if gap is None else round(gap*100, 3),
+        ]
+        ws = GSHEET.worksheet(WS_AI_LOG)
+        safe_append_row(ws, row, value_input_option="USER_ENTERED", ctx=ctx_tag)
+        # ✅ 탈락 사유 서식 적용 (reason 열에 색상)
+        if status == "DROP" and reason:
+            row_number = len(ws.get("A:A"))  # 방금 추가된 행 번호(1열만 조회)
+            reason_col_index = 7  # reason은 7번째 열 (A=1, B=2, ..., G=7)
+            apply_drop_reason_formatting(ws, row_number, reason_col_index, reason)
+            
+    except Exception as e:
+        print(f"⚠️ log_ai_thought 에러: {e}")
+
+def find_header_row(ws, required=("매매구분", "종목코드")):
+    # 헤더가 1행이 아닐 수 있어서 1~5행에서 탐색
+    for r in range(1, 6):
+        vals = ws.row_values(r)
+        if vals and all(k in vals for k in required):
+            return r, vals
+    # fallback
+    vals = ws.row_values(1)
+    return 1, vals
+
+
+def log_trade_to_sheet(ts, ticker, market, exch, side, price, qty, pnl, strategy, note=""):
+    """
+    주식거래_RAW 시트에 매매 로그 기록
+    - 한국 주식 티커에 .KS/.KQ 자동 추가
+    - 거래일, 증권사, 계좌, 종목명, Ticker, 매매구분, 수량, 통화, 평단가 등 기록
+    """
+    if not GSHEET:
+        return
+    try:
+        # 주식거래_RAW 시트 사용
+        try:
+            ws = GSHEET.worksheet("주식거래_RAW")
+        except:
+            # fallback: 기존 시트 이름 사용
+            ws = GSHEET.worksheet(WS_TRADES)
+        
+        _, headers = find_header_row(ws, required=("매매구분", "Ticker"))
+        if not headers:
+            print("⚠️ 주식거래_RAW 헤더를 읽지 못함")
+            return
+
+        row = [""] * len(headers)
+
+        def set_any(names, value):
+            for name in names:
+                if name in headers:
+                    row[headers.index(name)] = value
+                    return
+        
+        # 한국 주식 티커에 .KS/.KQ 추가
+        formatted_ticker = ticker
+        if market == "KR":
+            if not ticker.endswith(".KS") and not ticker.endswith(".KQ"):
+                # KR_TICKER_MAP에서 확인하여 .KS/.KQ 추가
+                if ticker in KR_TICKER_MAP:
+                    formatted_ticker = KR_TICKER_MAP[ticker]
+                elif re.fullmatch(r"\\d{6}", ticker):
+                    # 6자리 숫자면 .KS로 가정 (나중에 .KQ로 수정 필요시 별도 로직)
+                    formatted_ticker = f"{ticker}.KS"
+        
+        # 종목명 가져오기
+        stock_name = ticker
+        if market == "KR":
+            # KR_TICKER_MAP에서 역으로 찾기
+            clean_ticker = ticker.replace(".KS", "").replace(".KQ", "")
+            for name, t in KR_TICKER_MAP.items():
+                if t == formatted_ticker and not re.fullmatch(r"\\d{6}", name):
+                    stock_name = name
+                    break
+        elif formatted_ticker in TICKER_CONFIG:
+            stock_name = TICKER_CONFIG[formatted_ticker].get("stock_name", ticker)
+        
+        # ✅ 주식거래_RAW 컬럼 매핑
+        set_any(["거래일", "일자", "구매일"], ts.split(" ")[0])
+        set_any(["증권사", "브로커"], os.getenv("BROKER_NAME", "KIS"))
+        set_any(["계좌"], os.getenv("ACCOUNT_NAME", "KIS01"))
+        set_any(["종목명", "종목"], stock_name)
+        set_any(["Ticker", "종목코드", "코드", "티커"], formatted_ticker)
+        set_any(["매매구분", "매수/매도", "매수·매도"], "매수" if side == "BUY" else "매도")
+        set_any(["수량", "주수"], qty)
+        set_any(["통화", "Currency"], "USD" if market == "US" else "KRW")
+        set_any(["평단가", "단가", "가격"], price)
+        set_any(["금액"], int(price * qty * (EXCHANGE_RATE if market == "US" else 1)))
+        set_any(["환율"], EXCHANGE_RATE if market == "US" else 1)
+        set_any(["비고", "메모", "설명"], f"{strategy} | {note}".strip(" |"))
+
+        # ✅ USER_ENTERED로 넣어야 시트 수식/서식 흐름 유지
+        safe_append_row(ws, row, value_input_option="USER_ENTERED", ctx="TRADE_LOG")
+        # ✅ 거래 행 조건부 서식 적용 (매수/매도 색상)
+        row_number = len(ws.get("A:A"))  # 방금 추가된 행 번호(1열만 조회)
+        apply_trade_row_formatting(ws, row_number, side)
+        
+        # ✅ Dashboard 지표 업데이트
+        update_dashboard_metrics()
+        
+        print(f"📝 주식거래_RAW 로깅: {stock_name}({formatted_ticker}) {side} {qty}주 @{price}")
+
+    except Exception as e:
+        print(f"⚠️ log_trade_to_sheet 에러: {e}")
+
+# ==============================================================================
+# [3.5] 프로페셔널 대시보드: 조건부 서식 및 Dashboard 탭
+# ==============================================================================
+
+def format_sheet_headers(ws):
+    """
+    시트의 1행(헤더)에 프로페셔널 서식 적용:
+    - 틀 고정 (Freeze row 1)
+    - 남색 배경 (#1A237E)
+    - 흰색 굵은 글씨
+    - 가운데 정렬
+    """
+    try:
+        # 틀 고정: 1행
+        set_frozen(ws, rows=1)
+        
+        # 헤더 서식
+        header_format = CellFormat(
+            backgroundColor=Color(0.102, 0.137, 0.494),  # #1A237E (남색)
+            textFormat=TextFormat(
+                bold=True,
+                foregroundColor=Color(1, 1, 1)  # 흰색
+            ),
+            horizontalAlignment='CENTER',
+            verticalAlignment='MIDDLE'
+        )
+        
+        # 1행 전체에 서식 적용
+        format_cell_range(ws, '1:1', header_format)
+        
+    except Exception as e:
+        print(f"⚠️ format_sheet_headers 에러: {e}")
+
+
+def apply_trade_row_formatting(ws, row_number, side):
+    """
+    거래 행에 조건부 서식 적용:
+    - 매수: 연한 파란색 배경 (#E3F2FD)
+    - 매도: 연한 빨간색 배경 (#FFEBEE)
+    """
+    try:
+        if side == "BUY":
+            bg_color = Color(0.89, 0.949, 0.992)  # #E3F2FD (연한 파란색)
+        else:  # SELL
+            bg_color = Color(1.0, 0.922, 0.933)  # #FFEBEE (연한 빨간색)
+        
+        row_format = CellFormat(backgroundColor=bg_color)
+        format_cell_range(ws, f'{row_number}:{row_number}', row_format)
+        
+    except Exception as e:
+        print(f"⚠️ apply_trade_row_formatting 에러: {e}")
+
+
+def apply_drop_reason_formatting(ws, row_number, col_index, reason):
+    """
+    탈락 사유별 색상 적용:
+    - LOW_SCORE: 회색 배경 (#E0E0E0)
+    - PRICE_GAP: 주황색 배경 (#FFE0B2)
+    - MAX_POS: 노란색 배경 (#FFF9C4)
+    """
+    try:
+        if "LOW_SCORE" in reason:
+            bg_color = Color(0.878, 0.878, 0.878)  # #E0E0E0 (회색)
+        elif "PRICE_GAP" in reason:
+            bg_color = Color(1.0, 0.878, 0.698)  # #FFE0B2 (주황색)
+        elif "MAX_POS" in reason:
+            bg_color = Color(1.0, 0.976, 0.769)  # #FFF9C4 (노란색)
+        else:
+            return  # 다른 사유는 서식 적용 안 함
+        
+        cell_format = CellFormat(backgroundColor=bg_color)
+        # 열 인덱스를 문자로 변환 (1->A, 2->B, ...)
+        col_letter = chr(64 + col_index) if col_index <= 26 else 'A'
+        format_cell_range(ws, f'{col_letter}{row_number}', cell_format)
+        
+    except Exception as e:
+        print(f"⚠️ apply_drop_reason_formatting 에러: {e}")
+
+
+def create_dashboard_tab():
+    """
+    Dashboard 탭 생성 및 초기 설정:
+    - 실시간 지표 레이블 및 수식 설정
+    - B2: 현재 총 자산
+    - B3: 오늘 누적 수익률 (%)
+    - B4: 깔때기 통계 (총 신호 대비 최종 주문 성공률)
+    """
+    if not GSHEET:
+        return
+    
+    try:
+        # Dashboard 탭이 이미 있는지 확인
+        try:
+            ws = GSHEET.worksheet(WS_DASHBOARD)
+            print("✅ Dashboard 탭이 이미 존재합니다")
+            return ws
+        except:
+            # 없으면 새로 생성
+            ws = GSHEET.add_worksheet(title=WS_DASHBOARD, rows=100, cols=10)
+            print("✅ Dashboard 탭 생성 완료")
+        
+        # 헤더 및 레이블 설정
+        ws.update('A1', [['📊 주식 봇 실시간 대시보드']])
+        ws.update('A2', [['현재 총 자산 (KRW)']])
+        ws.update('A3', [['오늘 누적 수익률 (%)']])
+        ws.update('A4', [['깔때기 통계 (성공률 %)']])
+        
+        # 초기값 설정 (나중에 update_dashboard_metrics에서 업데이트)
+        ws.update('B2', [[0]])
+        ws.update('B3', [[0]])
+        ws.update('B4', [[0]])
+        
+        # 헤더 서식 적용
+        format_sheet_headers(ws)
+        
+        # 제목 서식 (A1)
+        title_format = CellFormat(
+            backgroundColor=Color(0.102, 0.137, 0.494),
+            textFormat=TextFormat(
+                bold=True,
+                fontSize=14,
+                foregroundColor=Color(1, 1, 1)
+            ),
+            horizontalAlignment='CENTER'
+        )
+        format_cell_range(ws, 'A1:B1', title_format)
+        
+        # 레이블 서식 (A2:A4)
+        label_format = CellFormat(
+            textFormat=TextFormat(bold=True),
+            horizontalAlignment='RIGHT'
+        )
+        format_cell_range(ws, 'A2:A4', label_format)
+        
+        # 값 서식 (B2:B4)
+        value_format = CellFormat(
+            textFormat=TextFormat(fontSize=12),
+            horizontalAlignment='LEFT'
+        )
+        format_cell_range(ws, 'B2:B4', value_format)
+        
+        return ws
+        
+    except Exception as e:
+        print(f"⚠️ create_dashboard_tab 에러: {e}")
+        return None
+
+
+def update_dashboard_metrics():
+    """
+    Dashboard 탭의 실시간 지표 업데이트:
+    - B2: 현재 총 자산 (VIRTUAL_CASH + 평가금)
+    - B3: 오늘 누적 수익률 (%)
+    - B4: 깔때기 통계 (총 신호 대비 최종 주문 성공률)
+    """
+    if not GSHEET:
+        return
+    
+    try:
+        ws = GSHEET.worksheet(WS_DASHBOARD)
+        
+        # 현재 총 자산 계산
+        portfolio_value = 0
+        for ticker, info in PORTFOLIO.items():
+            qty = info.get('qty', 0)
+            avg_price = info.get('avg_price', 0)
+            market = info.get('market', 'KR')
+            
+            # 간단한 평가금 계산 (실제로는 현재가 조회 필요)
+            if market == 'US':
+                portfolio_value += qty * avg_price * EXCHANGE_RATE
+            else:
+                portfolio_value += qty * avg_price
+        
+        total_asset = VIRTUAL_CASH_KRW + portfolio_value
+        
+        # 오늘 누적 수익률 계산
+        initial_cash = 10_000_000  # VIRTUAL_CASH_KRW 초기값
+        profit_rate = (TODAY_PROFIT_KRW / initial_cash) * 100 if initial_cash > 0 else 0
+        
+        # 깔때기 통계 계산
+        total_signals = OBS["kpi"].get("ai_candidates", 0)
+        total_orders = OBS["kpi"].get("order_success", 0)
+        funnel_rate = (total_orders / total_signals * 100) if total_signals > 0 else 0
+        
+        # 업데이트
+        ws.update('B2', [[f'{int(total_asset):,}원']])
+        ws.update('B3', [[f'{profit_rate:.2f}%']])
+        ws.update('B4', [[f'{funnel_rate:.1f}% ({total_orders}/{total_signals})']])
+        
+    except Exception as e:
+        print(f"⚠️ update_dashboard_metrics 에러: {e}")
+
+
+# ==============================================================================
+# [4] 티커 로딩
+# ==============================================================================
+def load_kr_tickers():
+    global KR_TICKER_MAP
+    try:
+        print("🔄 KRX 종목 로딩 중...")
+        df_kospi = fdr.StockListing("KOSPI")
+        for _, r in df_kospi.iterrows():
+            code = str(r["Code"])
+            name = r["Name"]
+            KR_TICKER_MAP[name] = f"{code}.KS"
+            KR_TICKER_MAP[code] = f"{code}.KS"
+        df_kosdaq = fdr.StockListing("KOSDAQ")
+        for _, r in df_kosdaq.iterrows():
+            code = str(r["Code"])
+            name = r["Name"]
+            KR_TICKER_MAP[name] = f"{code}.KQ"
+            KR_TICKER_MAP[code] = f"{code}.KQ"
+        print(f"✅ KRX 로딩 완료 (맵핑 {len(KR_TICKER_MAP)}개)")
+    except Exception as e:
+        print(f"⚠️ KRX 로딩 실패: {e}")
+
+def normalize_kr_symbol(ticker_or_name: str):
+    if ticker_or_name in KR_TICKER_MAP:
+        return KR_TICKER_MAP[ticker_or_name]
+    if re.fullmatch(r"\d{6}", ticker_or_name):
+        return f"{ticker_or_name}.KS"
+    return None
+
+# ==============================================================================
+# [4.5] 구글 시트 양방향 연동: Ticker_Info 컨트롤 타워
+# ==============================================================================
+TICKER_CONFIG = {}  # {ticker: {active, target_weight, stop_loss, take_profit, stock_name}}
+
+def load_ticker_config():
+    """
+    Ticker_Info 시트에서 매매 파라미터를 읽어옵니다.
+    컬럼: Ticker, 종목명, Active, 목표비중, 손절기준, 익절기준
+    """
+    global TICKER_CONFIG
+    if not GSHEET:
+        print("⚠️ 시트 연결 안 됨 - Ticker_Info 로딩 불가")
+        return {}
+    
+    try:
+        ws = GSHEET.worksheet("Ticker_Info")
+        all_data = ws.get_all_values()
+        
+        if not all_data or len(all_data) < 2:
+            print("⚠️ Ticker_Info 시트가 비어있습니다")
+            return {}
+        
+        headers = all_data[0]
+        
+        # 헤더 인덱스 찾기
+        try:
+            ticker_idx = headers.index("Ticker")
+            name_idx = headers.index("종목명")
+        except ValueError as e:
+            print(f"⚠️ Ticker_Info 시트에 필수 컬럼이 없습니다: {e}")
+            return {}
+        
+        # 선택적 컬럼 (없으면 기본값 사용)
+        active_idx = headers.index("Active") if "Active" in headers else None
+        weight_idx = headers.index("목표비중") if "목표비중" in headers else None
+        stop_idx = headers.index("손절기준") if "손절기준" in headers else None
+        profit_idx = headers.index("익절기준") if "익절기준" in headers else None
+        
+        config = {}
+        for row in all_data[1:]:  # 헤더 제외
+            if len(row) <= ticker_idx:
+                continue
+            
+            ticker = row[ticker_idx].strip()
+            if not ticker:
+                continue
+            
+            stock_name = row[name_idx] if len(row) > name_idx else ""
+            
+            # Active (기본값: TRUE)
+            active = True
+            if active_idx and len(row) > active_idx:
+                active_val = row[active_idx].strip().upper()
+                active = active_val in ("TRUE", "T", "1", "YES", "Y", "")
+            
+            # 목표비중 (기본값: 10%)
+            target_weight = 0.10
+            if weight_idx and len(row) > weight_idx:
+                weight_str = row[weight_idx].strip().replace("%", "")
+                if weight_str:
+                    try:
+                        target_weight = float(weight_str) / 100.0
+                    except:
+                        pass
+            
+            # 손절기준 (기본값: -15%)
+            stop_loss = -0.15
+            if stop_idx and len(row) > stop_idx:
+                stop_str = row[stop_idx].strip().replace("%", "")
+                if stop_str:
+                    try:
+                        stop_loss = float(stop_str) / 100.0
+                    except:
+                        pass
+            
+            # 익절기준 (기본값: +30%)
+            take_profit = 0.30
+            if profit_idx and len(row) > profit_idx:
+                profit_str = row[profit_idx].strip().replace("%", "")
+                if profit_str:
+                    try:
+                        take_profit = float(profit_str) / 100.0
+                    except:
+                        pass
+            
+            config[ticker] = {
+                "active": active,
+                "target_weight": target_weight,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "stock_name": stock_name,
+            }
+        
+        TICKER_CONFIG = config
+        print(f"✅ Ticker_Info 로딩 완료: {len(config)}개 종목")
+        print(f"   Active 종목: {sum(1 for v in config.values() if v['active'])}개")
+        return config
+    
+    except Exception as e:
+        print(f"⚠️ Ticker_Info 로딩 실패: {e}")
+        return {}
+
+
+def is_ticker_active(ticker: str) -> bool:
+    """특정 ticker가 매매 활성화되어 있는지 확인"""
+    # .KS, .KQ 제거하고 체크
+    clean_ticker = ticker.replace(".KS", "").replace(".KQ", "")
+    
+    # TICKER_CONFIG에서 확인
+    if clean_ticker in TICKER_CONFIG:
+        return TICKER_CONFIG[clean_ticker].get("active", True)
+    
+    # 원본 ticker로도 확인
+    if ticker in TICKER_CONFIG:
+        return TICKER_CONFIG[ticker].get("active", True)
+    
+    # 설정에 없으면 기본값 True
+    return True
+
+
+def get_position_size_from_config(ticker: str, market: str) -> int:
+    """
+    Ticker_Info의 목표비중에 따라 투자금액 계산
+    목표비중이 없으면 기존 calc_amount_proportional 로직 사용
+    """
+    clean_ticker = ticker.replace(".KS", "").replace(".KQ", "")
+    
+    config = TICKER_CONFIG.get(clean_ticker) or TICKER_CONFIG.get(ticker)
+    
+    if config and "target_weight" in config:
+        target_weight = config["target_weight"]
+        total_equity = calc_equity()
+        
+        # 목표비중 * 총자산
+        target_amount = total_equity * target_weight
+        
+        # 변동성 타겟팅 적용 (US만)
+        target_amount *= vol_target_multiplier(market)
+        
+        # MIN/MAX 제한
+        target_amount = max(MIN_TRADE_KRW, min(target_amount, MAX_TRADE_KRW))
+        
+        return int(target_amount)
+    
+    # 설정에 없으면 기본 로직 (soft_score 기반)
+    # 기본 점수 85로 가정
+    return calc_amount_proportional(85.0, market)
+
+
+def check_stop_loss_take_profit(ticker: str, current_price: float) -> dict:
+    """
+    현재 포지션의 손익률을 계산하여 손절/익절 필요 여부 판단
+    
+    Returns:
+        {
+            "action": "HOLD" | "STOP_LOSS" | "TAKE_PROFIT",
+            "pnl_pct": float,
+            "reason": str
+        }
+    """
+    if ticker not in PORTFOLIO:
+        return {"action": "HOLD", "pnl_pct": 0, "reason": "No position"}
+    
+    pos = PORTFOLIO[ticker]
+    avg_price = pos.get("avg_price", 0)
+    
+    if avg_price <= 0:
+        return {"action": "HOLD", "pnl_pct": 0, "reason": "Invalid avg_price"}
+    
+    # 손익률 계산
+    pnl_pct = (current_price - avg_price) / avg_price
+    
+    # Ticker_Info에서 손절/익절 기준 읽기
+    clean_ticker = ticker.replace(".KS", "").replace(".KQ", "")
+    config = TICKER_CONFIG.get(clean_ticker) or TICKER_CONFIG.get(ticker)
+    
+    if config:
+        stop_loss = config.get("stop_loss", STOP_LOSS_PCT)
+        take_profit = config.get("take_profit", TAKE_PROFIT_PCT)
+    else:
+        # 기본값 사용
+        stop_loss = STOP_LOSS_PCT
+        take_profit = TAKE_PROFIT_PCT
+    
+    # 손절 체크
+    if pnl_pct <= stop_loss:
+        return {
+            "action": "STOP_LOSS",
+            "pnl_pct": pnl_pct,
+            "reason": f"손절: {pnl_pct*100:.2f}% (기준: {stop_loss*100:.1f}%)"
+        }
+    
+    # 익절 체크
+    if pnl_pct >= take_profit:
+        return {
+            "action": "TAKE_PROFIT",
+            "pnl_pct": pnl_pct,
+            "reason": f"익절: {pnl_pct*100:.2f}% (기준: {take_profit*100:.1f}%)"
+        }
+    
+    return {"action": "HOLD", "pnl_pct": pnl_pct, "reason": "홀딩"}
+
+
+# ==============================================================================
+# [5] 마켓 오픈 판정 (DST 포함)
+# ==============================================================================
+def is_kr_market_open(dt_kr=None) -> bool:
+    dt_kr = dt_kr or now_kr()
+    hm = dt_kr.hour * 100 + dt_kr.minute
+    return 900 <= hm <= 1530
+
+def is_us_market_open(dt_kr=None) -> bool:
+    # ET 기준 09:30~16:00 (DST 자동 반영)
+    dt_kr = dt_kr or now_kr()
+    dt_et = dt_kr.astimezone(TZ_ET)
+    h = dt_et.hour
+    m = dt_et.minute
+    # 09:30~16:00
+    if (h > 9 and h < 16):
+        return True
+    if h == 9 and m >= 30:
+        return True
+    if h == 16 and m == 0:
+        return True
+    return False
+
+# ==============================================================================
+# [6] 뉴스 + 레이더(스캐너)
+# ==============================================================================
+MASTER_KEYWORDS = [
+    # 공통
+    "Earnings","Revenue","Profit","Guidance","Surprise","EPS",
+    "Contract","Deal","Won","Acquisition","Merger","Buyback","Dividend",
+    "Breakout","Squeeze","Volume","Halt","FDA","Approval","Offering","IPO",
+    # KR
+    "실적","매출","영업이익","순이익","가이던스","서프라이즈","흑자전환",
+    "계약","수주","체결","제휴","승인","인수","합병","지분","자사주","소각","배당",
+    "급등","상한가","신고가","돌파","폭등","쇼트스퀴즈","거래량","VI",
+    "특징주","공시","정정","유상증자","감자","전환사채","CB","BW"
+]
+
+def fetch_rss_titles(feeds):
+    titles = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        fut_map = {executor.submit(feedparser.parse, url): url for url in feeds}
+        for fut in concurrent.futures.as_completed(fut_map):
+            try:
+                feed = fut.result()
+                for entry in getattr(feed, "entries", [])[:120]:
+                    link = getattr(entry, "link", "")
+                    title = getattr(entry, "title", "")
+                    if not title:
+                        continue
+                    if link and link in SEEN_LINKS:
+                        continue
+                    if any(kw.lower() in title.lower() for kw in MASTER_KEYWORDS):
+                        titles.append(title.strip())
+                        if link:
+                            SEEN_LINKS[link] = int(time.time())
+            except Exception as e:
+                print(f"⚠️ RSS 파싱 에러: {e}")
+    return titles[:200]
+
+def fetch_news_24h():
+    # KR/US 둘 다 항상 수집
+    kr_feeds = [
+        "https://rss.hankyung.com/feed/market.xml",
+        # 필요 시 여기에 KR RSS 추가
+    ]
+    us_feeds = [
+        "http://feeds.marketwatch.com/marketwatch/topstories/",
+        "http://feeds.reuters.com/reuters/businessNews",
+        # 필요 시 여기에 US RSS 추가
+    ]
+    prune_seen_links()
+    kr_titles = fetch_rss_titles(kr_feeds)
+    us_titles = fetch_rss_titles(us_feeds)
+    return kr_titles, us_titles
+
+# ---------------------------
+# KR 레이더: 네이버 금융 "거래상위/급등/급락"에서 후보 수집
+# ---------------------------
+def scan_kr_radar():
+    candidates = set()
+    urls = [
+        # 거래량 상위
+        "https://finance.naver.com/sise/sise_quant.naver",
+        # 상승률 상위
+        "https://finance.naver.com/sise/sise_rise.naver",
+        # 하락률 상위
+        "https://finance.naver.com/sise/sise_fall.naver",
+    ]
+    for url in urls:
+        try:
+            html = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}).text
+            dfs = pd.read_html(StringIO(html))
+            if not dfs:
+                continue
+            df = dfs[1] if len(dfs) > 1 else dfs[0]
+            # 종목명 컬럼에서 링크에 code= 추출
+            codes = re.findall(r"code=(\d{6})", html)
+            # 너무 많으면 상위만
+            for c in codes[:60]:
+                candidates.add(c)
+        except Exception as e:
+            print(f"⚠️ KR 레이더 실패({url}): {e}")
+    return list(candidates)[:80]
+
+# ---------------------------
+# US 레이더: Yahoo Screener JSON (most_actives / day_gainers / day_losers)
+# ---------------------------
+def yahoo_screener(scr_id="most_actives", count=80):
+    url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    try:
+        r = requests.get(url, params={"scrIds": scr_id, "count": count, "start": 0}, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        js = r.json()
+        quotes = js.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        out = []
+        for q in quotes:
+            sym = q.get("symbol")
+            if sym and isinstance(sym, str) and sym.isascii():
+                out.append(sym.upper())
+        return out[:count]
+    except Exception as e:
+        print(f"⚠️ US 레이더 실패({scr_id}): {e}")
+        return []
+
+def scan_us_radar():
+    cand = set()
+    for sid in ["most_actives", "day_gainers", "day_losers"]:
+        for s in yahoo_screener(sid, 80):
+            cand.add(s)
+    return list(cand)[:150]
+
+# ==============================================================================
+# [7] AI 분석 (KR / US 분리)
+# ==============================================================================
+def analyze_with_ai(market: str, news_titles: list, radar_tickers: list):
+    if not model:
+        return []
+    # 입력이 너무 길어지면 성능/비용/시간 다 깨짐 -> 상한
+    news_titles = news_titles[:60]
+    radar_tickers = radar_tickers[:120]
+
+    prompt = f"""
+역할: 당신은 전문 퀀트 트레이더다.
+시장: {market}
+
+[입력]
+1) 뉴스 헤드라인(중요 키워드만 걸러진 리스트)
+2) 레이더 티커(뉴스가 없어도 오늘 거래가 튀는 종목 후보)
+
+[목표]
+- 단기(스캘프/스윙) 관점에서 "확률이 높은" 후보 5개 이하를 고르고,
+- 각각에 대해 점수/이유/거래스타일을 제시해라.
+- 뉴스가 없고 레이더로만 잡힌 종목도 가능하나, 그 경우 "레이다후보"라고 명시.
+
+[규칙]
+- 출력은 JSON 리스트만.
+- reason은 반드시 한글.
+- market은 "KR" 또는 "US"를 그대로 넣어라.
+- KR 티커는 6자리 코드(예: 005930) 또는 종목명.
+- US 티커는 예: NVDA, TSLA.
+- score 0~100 (80 이상만 진입 후보로 추천)
+- trade_type: "SCALP" 또는 "SWING"
+
+[출력 예시]
+[
+  {{"market":"KR","ticker":"005930","score":88,"trade_type":"SWING","reason":"..."}},
+  {{"market":"US","ticker":"NVDA","score":92,"trade_type":"SWING","reason":"..."}}
+]
+
+[뉴스]
+{json.dumps(news_titles, ensure_ascii=False)}
+
+[레이더 티커]
+{json.dumps(radar_tickers, ensure_ascii=False)}
+"""
+    try:
+        res = model.generate_content(prompt)
+        text = res.text.replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\[.*\]", text, re.DOTALL)
+        if not m:
+            print("⚠️ AI 응답에서 JSON 리스트를 찾지 못함")
+            return []
+        arr = json.loads(m.group())
+        if not isinstance(arr, list):
+            return []
+        return arr
+    except Exception as e:
+        print(f"⚠️ analyze_with_ai 에러: {e}")
+        return []
+
+# ==============================================================================
+# [8] KIS: 토큰/해시키/시세/주문 (KR+US)
+# ==============================================================================
+def kis_token():
+    global ACCESS_TOKEN, ACCESS_TOKEN_EXPIRES_AT
+    # 토큰 캐시
+    if ACCESS_TOKEN and time.time() < ACCESS_TOKEN_EXPIRES_AT - 30:
+        return ACCESS_TOKEN
+
+    try:
+        url = f"{kis_domain()}/oauth2/tokenP"
+        r = requests.post(url, json={
+            "grant_type": "client_credentials",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET
+        }, timeout=8)
+        js = r.json()
+        ACCESS_TOKEN = js.get("access_token", "")
+        expires_in = safe_int(js.get("expires_in"), 1800)
+        ACCESS_TOKEN_EXPIRES_AT = int(time.time()) + expires_in
+        return ACCESS_TOKEN
+    except Exception as e:
+        print(f"⚠️ kis_token 에러: {e}")
+        return ""
+
+def kis_hashkey(token: str, body: dict) -> str:
+    try:
+        url = f"{kis_domain()}/uapi/hashkey"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appKey": KIS_APP_KEY,
+            "appSecret": KIS_APP_SECRET,
+        }
+        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=8)
+        js = r.json()
+        return js.get("HASH", "") or js.get("hash", "")
+    except Exception as e:
+        print(f"⚠️ kis_hashkey 에러: {e}")
+        return ""
+
+# --------------------------
+# KIS 국내 현재가
+# --------------------------
+def kis_price_kr(code6: str):
+    try:
+        token = kis_token()
+        if not token:
+            return None
+        url = f"{kis_domain()}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appKey": KIS_APP_KEY,
+            "appSecret": KIS_APP_SECRET,
+            "tr_id": "FHKST01010100",  # 국내 현재가
+        }
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code6
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+        js = r.json()
+        out = js.get("output", {})
+        price = safe_float(out.get("stck_prpr"))
+        return price
+    except Exception as e:
+        print(f"⚠️ kis_price_kr 에러: {e}")
+        return None
+
+# --------------------------
+# KIS 해외 현재가 (EXCD, SYMB)
+# - 예시: EXCD=NASD, SYMB=AAPL
+# --------------------------
+def kis_price_us(symbol: str, exch: str):
+    try:
+        token = kis_token()
+        if not token:
+            return None
+        url = f"{kis_domain()}/uapi/overseas-price/v1/quotations/price"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appKey": KIS_APP_KEY,
+            "appSecret": KIS_APP_SECRET,
+            "tr_id": "HHDFS00000300",  # 해외 현재가  [oai_citation:1‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+        }
+        params = {
+            "AUTH": "",
+            "EXCD": exch,
+            "SYMB": symbol
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+        js = r.json()
+        out = js.get("output", {})
+        # KIS 해외현재가 필드가 케이스마다 다를 수 있어 후보 다 탐색
+        for k in ["last", "last_price", "ovrs_nmix_prpr", "stck_prpr", "prpr"]:
+            p = safe_float(out.get(k))
+            if p:
+                return p
+        # 그래도 없으면 output2 등도 탐색
+        out2 = js.get("output2", {})
+        for k in ["last", "ovrs_nmix_prpr", "prpr"]:
+            p = safe_float(out2.get(k))
+            if p:
+                return p
+        return None
+    except Exception as e:
+        print(f"⚠️ kis_price_us 에러: {e}")
+        return None
+
+# --------------------------
+# KIS 주문 (국내)
+# --------------------------
+def kis_order_kr(code6: str, qty: int, price: float, side: str):
+    if DRY_RUN:
+        return True, "DRY_RUN"
+
+    token = kis_token()
+    if not token:
+        return False, "NO_TOKEN"
+
+    # tr_id (모의/실전 차이)
+    # 국내주식 현금매수/매도는 기존 코드 기반 유지:
+    # - 실전: TTTC0802U / TTTC0801U
+    # - 모의: VTTC0802U / VTTC0801U (환경에 따라 다를 수 있어 실패 시 로그로 확인)
+    if KIS_ENV == "VIRTUAL":
+        tr_id = "VTTC0802U" if side == "BUY" else "VTTC0801U"
+    else:
+        tr_id = "TTTC0802U" if side == "BUY" else "TTTC0801U"
+
+    url = f"{kis_domain()}/uapi/domestic-stock/v1/trading/order-cash"
+    body = {
+        "CANO": KIS_CANO,
+        "ACNT_PRDT_CD": KIS_ACNT_PRDT_CD,
+        "PDNO": code6,
+        "ORD_DVSN": "01" if price == 0 else "00",
+        "ORD_QTY": str(qty),
+        "ORD_UNPR": str(int(price)) if price else "0",
+    }
+
+    hk = kis_hashkey(token, body)
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "appKey": KIS_APP_KEY,
+        "appSecret": KIS_APP_SECRET,
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    if hk:
+        headers["hashkey"] = hk
+
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+        js = r.json()
+        ok = (js.get("rt_cd") == "0")
+        return ok, js.get("msg1", "")
+    except Exception as e:
+        return False, str(e)
+
+# --------------------------
+# KIS 주문 (해외주식) - US까지 자동매매 확장
+# - 해외 주문 바디/필드: OVRS_EXCG_CD, PDNO, OVRS_ORD_UNPR, ORD_DVSN 등  [oai_citation:2‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+# --------------------------
+def kis_order_us(symbol: str, exch: str, qty: int, price: float, side: str):
+    if DRY_RUN:
+        return True, "DRY_RUN"
+
+    token = kis_token()
+    if not token:
+        return False, "NO_TOKEN"
+
+    # 해외 TR_ID (모의/실전)
+    # - 실전 BUY: TTTT1002U / SELL: TTTT1006U
+    # - 모의 BUY: VTTT1002U / SELL: VTTT1001U (참조 구현)  [oai_citation:3‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+    if KIS_ENV == "VIRTUAL":
+        tr_id = "VTTT1002U" if side == "BUY" else "VTTT1001U"
+    else:
+        tr_id = "TTTT1002U" if side == "BUY" else "TTTT1006U"
+
+    url = f"{kis_domain()}/uapi/overseas-stock/v1/trading/order"
+    body = {
+        "CANO": KIS_CANO,
+        "ACNT_PRDT_CD": KIS_ACNT_PRDT_CD,
+        "OVRS_EXCG_CD": exch,     # NASD / NYSE / AMEX ...  [oai_citation:4‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+        "PDNO": symbol,           # AAPL ...  [oai_citation:5‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+        "ORD_QTY": str(qty),
+        "OVRS_ORD_UNPR": str(round(price, 2)) if price else "0",
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN": "00" if price and price > 0 else "01"  # 00 지정가 / 01 시장가  [oai_citation:6‡Glama – MCP Hosting Platform](https://glama.ai/mcp/servers/%40migusdn/KIS_MCP_Server/blob/090021d7c863b24ce37cb029e563b1ec7e42a5c4/server.py)
+    }
+
+    hk = kis_hashkey(token, body)
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "appKey": KIS_APP_KEY,
+        "appSecret": KIS_APP_SECRET,
+        "tr_id": tr_id,
+    }
+    if hk:
+        headers["hashkey"] = hk
+
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=12)
+        js = r.json()
+        ok = (js.get("rt_cd") == "0")
+        return ok, js.get("msg1", "")
+    except Exception as e:
+        return False, str(e)
+
+# ==============================================================================
+# [9] 가격: YF(분석) + KIS(주문직전) 교차검증
+# ==============================================================================
+def yf_price(market: str, ticker: str):
+    try:
+        if market == "KR":
+            sym = normalize_kr_symbol(ticker)
+            if not sym:
+                return None
+        else:
+            sym = ticker.upper()
+        info = yf.Ticker(sym).fast_info
+        return safe_float(info.get("last_price"))
+    except:
+        return None
+
+def infer_us_exchange_code(ticker: str):
+    # yfinance exchange 코드 -> KIS EXCD로 근사 매핑
+    # NMS(나스닥), NYQ(뉴욕), ASE(아멕스)
+    try:
+        inf = yf.Ticker(ticker.upper()).fast_info
+        exch = (inf.get("exchange") or "").upper()
+        if "NMS" in exch or "NAS" in exch:
+            return "NASD"
+        if "NYQ" in exch or "NYS" in exch:
+            return "NYSE"
+        if "ASE" in exch or "AMEX" in exch:
+            return "AMEX"
+    except:
+        pass
+    return "NASD"
+
+def get_price_hybrid(market: str, ticker: str, exch: str = None):
+    """
+    return: (price_for_trade, yf_p, kis_p, gap)
+    """
+    yf_p = yf_price(market, ticker)
+    kis_p = None
+    if market == "KR":
+        if re.fullmatch(r"\d{6}", ticker):
+            kis_p = kis_price_kr(ticker)
+    else:
+        exch = exch or infer_us_exchange_code(ticker)
+        kis_p = kis_price_us(ticker.upper(), exch)
+
+    # KIS가 없으면 YF 사용
+    if not kis_p or not yf_p:
+        return (kis_p or yf_p), yf_p, kis_p, None
+
+    gap = abs(kis_p - yf_p) / yf_p if yf_p else None
+
+    # 하드 가드: 괴리 너무 크면 거래 스킵(상황 이상/데이터 이상)
+    if gap and gap >= LATENCY_GUARD_HARD:
+        return None, yf_p, kis_p, gap
+
+    # 소프트 가드: KIS가로 교체
+    if gap and gap >= LATENCY_GUARD_SOFT:
+        return kis_p, yf_p, kis_p, gap
+
+    # 괴리 작으면 YF 그대로 써도 되지만, 실제 체결은 KIS가가 더 안전
+    return kis_p, yf_p, kis_p, gap
+
+# ==============================================================================
+# [10] 기술 분석 (기존 SMC/OB+RSI 기반 유지)
+# ==============================================================================
+def analyze_technicals(market: str, ticker: str):
+    """
+    1개월 60분봉, OB + RSI + 거래대금 필터
+    """
+    try:
+        if market == "KR":
+            sym = normalize_kr_symbol(ticker)
+            if not sym:
+                return None
+        else:
+            sym = ticker.upper()
+
+        df = yf.Ticker(sym).history(period="1mo", interval="60m", prepost=True)
+        if df is None or df.empty or len(df) < 30:
+            return None
+
+        curr_price = float(df["Close"].iloc[-1])
+        avg_vol = df["Volume"][-5:].mean()
+        notional = curr_price * avg_vol * (EXCHANGE_RATE if market == "US" else 1)
+
+        if notional < MIN_VOLUME_KRW:
+            return None
+
+        # OB 탐색(단순)
+        ob_found = False
+        ob_range = (0.0, 0.0)
+        for i in range(len(df) - 2, max(len(df) - 30, 5), -1):
+            prev = df.iloc[i - 1]
+            curr = df.iloc[i]
+            if (curr["Close"] - prev["Close"]) / prev["Close"] > 0.02 and prev["Close"] < prev["Open"]:
+                ob_found = True
+                ob_range = (float(prev["Low"]), float(prev["High"]))
+                break
+
+        # RSI
+        delta = df["Close"].diff()
+        up = delta.clip(lower=0)
+        down = -1 * delta.clip(upper=0)
+        ema_up = up.ewm(com=13, adjust=False).mean()
+        ema_down = down.ewm(com=13, adjust=False).mean()
+        rs = ema_up / ema_down
+        rsi = float(100 - (100 / (1 + rs.iloc[-1])))
+
+        in_ob = ob_found and (ob_range[0] <= curr_price <= ob_range[1])
+
+        return {"price": curr_price, "rsi": rsi, "ob": ob_found, "in_ob": in_ob}
+    except Exception as e:
+        print(f"⚠️ analyze_technicals 에러: {e}")
+        return None
+
+# ==============================================================================
+# [11] 자산/비중 계산
+# ==============================================================================
+def calc_equity():
+    eq = VIRTUAL_CASH_KRW
+    for t, info in PORTFOLIO.items():
+        m = info.get("market")
+        exch = info.get("exch")
+        px, _, _, _ = get_price_hybrid(m, t, exch)
+        if px:
+            rate = EXCHANGE_RATE if m == "US" else 1
+            eq += px * info["qty"] * rate
+    return eq
+
+def calc_dynamic_amount(score: float):
+    base = calc_equity() * EQUITY_RATIO_PER_TRADE if USE_EQUITY_RATIO else INVEST_PER_TRADE_KRW
+    if score >= 90:
+        mult = 2.0
+    elif score >= 85:
+        mult = 1.5
+    else:
+        mult = 1.0
+    amt = base * mult
+    amt = max(amt, MIN_TRADE_KRW)
+    amt = min(amt, MAX_TRADE_KRW)
+    eq = calc_equity()
+    amt = min(amt, eq * MAX_TRADE_PCT, VIRTUAL_CASH_KRW)
+    return int(amt)
+
+# ==============================================================================
+# [12] 주문 실행(분할매수/매도) + 로그/상태 저장
+# ==============================================================================
+def place_order_scaled(market: str, ticker: str, side: str, price: float, exch=None,
+                       strategy="", reason="", base_amount=None, trade_type="DEFAULT"):
+    global VIRTUAL_CASH_KRW, TODAY_PROFIT_KRW, PORTFOLIO, DAILY_TRADE_COUNT
+
+    ts = now_kr().strftime("%Y-%m-%d %H:%M:%S")
+    rate = EXCHANGE_RATE if market == "US" else 1
+
+    if side == "BUY":
+        if DAILY_TRADE_COUNT.get(f"{market}:{ticker}", 0) >= MAX_RETRIES_PER_DAY:
+            return
+
+        p = PORTFOLIO.get(
+            ticker,
+            {"step": 0, "qty": 0, "avg_price": 0.0, "half_sold": False, "market": market, "trade_type": trade_type, "exch": exch}
+        )
+        if p["step"] >= len(SCALING_BUY_STEPS):
+            return
+
+        if base_amount is None:
+            base_amount = calc_dynamic_amount(85)
+
+        alloc_krw = base_amount * SCALING_BUY_STEPS[p["step"]]
+        qty = int(alloc_krw / (price * rate))
+        if qty <= 0:
+            return
+
+        cost = qty * price * rate
+        if cost > VIRTUAL_CASH_KRW:
+            qty = int(VIRTUAL_CASH_KRW / (price * rate))
+            cost = qty * price * rate
+            if qty <= 0:
+                return
+
+        # 주문
+        if market == "KR":
+            ok, msg = kis_order_kr(ticker, qty, price, "BUY")
+        else:
+            exch = exch or infer_us_exchange_code(ticker)
+            ok, msg = kis_order_us(ticker.upper(), exch, qty, price, "BUY")
+
+        if not ok:
+            send_telegram(f"❌ [주문실패][{market}] {ticker} BUY / {msg}")
+            return
+
+        # 포트폴리오 갱신
+        if p["qty"] + qty > 0:
+            p["avg_price"] = ((p["qty"] * p["avg_price"]) + (qty * price)) / (p["qty"] + qty)
+        p["qty"] += qty
+        p["step"] += 1
+        p["market"] = market
+        p["trade_type"] = trade_type
+        p["exch"] = exch
+        PORTFOLIO[ticker] = p
+
+        VIRTUAL_CASH_KRW -= cost
+        DAILY_TRADE_COUNT[f"{market}:{ticker}"] = DAILY_TRADE_COUNT.get(f"{market}:{ticker}", 0) + 1
+
+        log_trade_to_sheet(ts, ticker, market, exch, "BUY", price, qty, 0, f"{strategy}({p['step']}차)", note=msg)
+        send_telegram(f"🚀 [매수][{market}] {ticker} {p['step']}차\n가격: {price}\n금액: {int(cost):,}원\n사유: {reason}\n모드: KIS_ENV={KIS_ENV}, DRY_RUN={DRY_RUN}")
+
+        save_state()
+
+    elif side == "SELL":
+        if ticker not in PORTFOLIO:
+            return
+        p = PORTFOLIO[ticker]
+        exch = p.get("exch")
+
+        sell_qty = p["qty"]
+        if strategy == "익절_1차" and not p.get("half_sold", False):
+            sell_qty = int(p["qty"] * SCALING_SELL_STEPS[0])
+            p["half_sold"] = True
+
+        if sell_qty <= 0:
+            return
+
+        pnl = (price - p["avg_price"]) * sell_qty * rate
+
+        if market == "KR":
+            ok, msg = kis_order_kr(ticker, sell_qty, price, "SELL")
+        else:
+            exch = exch or infer_us_exchange_code(ticker)
+            ok, msg = kis_order_us(ticker.upper(), exch, sell_qty, price, "SELL")
+
+        if not ok:
+            send_telegram(f"❌ [주문실패][{market}] {ticker} SELL / {msg}")
+            return
+
+        TODAY_PROFIT_KRW += pnl
+        VIRTUAL_CASH_KRW += sell_qty * price * rate
+
+        log_trade_to_sheet(ts, ticker, market, exch, "SELL", price, sell_qty, int(pnl), strategy, note=msg)
+        send_telegram(f"💰 [매도][{market}] {ticker} ({strategy})\n수익: {int(pnl):,}원\n모드: KIS_ENV={KIS_ENV}, DRY_RUN={DRY_RUN}")
+
+        if sell_qty >= p["qty"]:
+            del PORTFOLIO[ticker]
+        else:
+            p["qty"] -= sell_qty
+            PORTFOLIO[ticker] = p
+
+        save_state()
+
+# ==============================================================================
+# [13] 포지션 관리 (손절/익절)
+# ==============================================================================
+def manage_positions_cycle():
+    for ticker, info in list(PORTFOLIO.items()):
+        m = info.get("market")
+        exch = info.get("exch")
+        px, yf_p, kis_p, gap = get_price_hybrid(m, ticker, exch)
+        if not px:
+            obs_drop("MANAGE_PX_NONE", m, ticker, None)
+            continue
+
+        pnl_pct = (px - info["avg_price"]) / info["avg_price"]
+
+        # (책 반영) Two-threshold stop-loss
+        # 1차: -5% -> 절반 청산
+        if pnl_pct <= -0.05 and not info.get("half_sold", False):
+            obs_inc("STOPLOSS_HALF")
+            place_order_scaled(m, ticker, "SELL", px, exch=exch, strategy="손절_1차(절반)")
+            continue
+
+        # 2차: -10% -> 전량 청산
+        if pnl_pct <= -0.10:
+            obs_inc("STOPLOSS_ALL")
+            place_order_scaled(m, ticker, "SELL", px, exch=exch, strategy="손절_2차(전량)")
+            continue
+
+        # 익절: 15% 전량(기존 유지)
+        if pnl_pct >= TAKE_PROFIT_PCT:
+            obs_inc("TAKEPROFIT_ALL")
+            place_order_scaled(m, ticker, "SELL", px, exch=exch, strategy="익절_완료")
+
+# ==============================================================================
+# [14] 메인 엔진: 24시간 수집 + 장 열리면 실행
+# ==============================================================================
+def daily_reset_if_needed():
+    global LAST_RESET_DATE, TODAY_PROFIT_KRW, DAILY_TRADE_COUNT
+    today = datetime.date.today()
+    if LAST_RESET_DATE != today:
+        LAST_RESET_DATE = today
+        TODAY_PROFIT_KRW = 0
+        DAILY_TRADE_COUNT = {}
+        print(f"🔄 [{today}] 일일 리셋 완료")
+        save_state()
+
+def update_fx():
+    global EXCHANGE_RATE
+    try:
+        today = datetime.date.today()
+        df_fx = fdr.DataReader("USD/KRW", today - datetime.timedelta(days=10))
+        EXCHANGE_RATE = float(df_fx["Close"].iloc[-1])
+    except Exception as e:
+        print(f"⚠️ 환율 조회 실패: {e}")
+
+def normalize_signal_market_and_ticker(sig):
+    market = str(sig.get("market", "")).strip().upper()
+    ticker = str(sig.get("ticker", "")).strip()
+    score = safe_float(sig.get("score"), 0)
+    reason = str(sig.get("reason", "사유 없음")).strip()
+    ttype = str(sig.get("trade_type", "SWING")).strip().upper()
+    if ttype not in ["SCALP", "SWING"]:
+        ttype = "SWING"
+
+    if market == "KR":
+        # 종목명 -> 코드로 정규화
+        if re.fullmatch(r"\d{6}", ticker):
+            code6 = ticker
+        else:
+            sym = normalize_kr_symbol(ticker)
+            if not sym:
+                return None
+            code6 = sym.split(".")[0]
+        return {"market": "KR", "ticker": code6, "score": score, "reason": reason, "trade_type": ttype, "exch": None}
+
+    if market == "US":
+        tkr = ticker.upper()
+        exch = infer_us_exchange_code(tkr)
+        return {"market": "US", "ticker": tkr, "score": score, "reason": reason, "trade_type": ttype, "exch": exch}
+
+    return None
+
+def enqueue_signal_if_market_closed(sig_norm):
+    # 시장 닫혀도 80+면 적재
+    if sig_norm["score"] < 80:
+        return
+    PENDING_SIGNALS.append({
+        "ts": now_kr().strftime("%Y-%m-%d %H:%M:%S"),
+        **sig_norm
+    })
+
+def pop_pending_for_market(market: str, max_n=10):
+    # 12시간 지난 건 버림
+    fresh = []
+    out = []
+    cutoff = now_kr() - datetime.timedelta(hours=12)
+    for s in PENDING_SIGNALS:
+        try:
+            ts = datetime.datetime.strptime(s["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ_KR)
+        except:
+            ts = now_kr()
+        if ts < cutoff:
+            continue
+        if s.get("market") == market and len(out) < max_n:
+            out.append(s)
+        else:
+            fresh.append(s)
+    # 남은 것(다른 시장/아직 남은 것)은 유지
+    # out 제외한 fresh + (out에서 max_n 초과분은 fresh로 남겨야 하는데 여기선 out 제한만)
+    # pending cap
+
+    if len(fresh) > MAX_PENDING_SIGNALS:
+
+        fresh = fresh[-MAX_PENDING_SIGNALS:]
+
+    PENDING_SIGNALS[:] = fresh
+    return out
+
+def main_engine_cycle():
+    sheet_heartbeat()
+    daily_reset_if_needed()
+    sheet_heartbeat()
+    update_fx()
+
+    dt = now_kr()
+    kr_open = is_kr_market_open(dt)
+    us_open = is_us_market_open(dt)
+
+    print(f"🕒 {dt.strftime('%Y-%m-%d %H:%M')} | KR_OPEN={kr_open} US_OPEN={us_open} | 현금:{int(VIRTUAL_CASH_KRW):,} 손익:{int(TODAY_PROFIT_KRW):,} 보유:{len(PORTFOLIO)} Pending:{len(PENDING_SIGNALS)}")
+
+    try:
+        log_ai_thought("SYS", "CYCLE", 0, "CYCLE_START", "SYS", "tick", source="ENGINE", ctx_tag="CYCLE_START")
+    except Exception as e:
+        print(f"⚠️ CYCLE_START 로그 실패: {e}")
+    # 24시간: 뉴스 + 레이더 수집
+    kr_news, us_news = fetch_news_24h()
+    kr_radar = scan_kr_radar()
+    us_radar = scan_us_radar()
+    print(f"[NEWS] KR={len(kr_news)} US={len(us_news)}")
+    print(f"[RADAR] KR={len(kr_radar)} US={len(us_radar)}")
+
+    # AI 분석(장 상관없이 수행)
+    kr_sigs = analyze_with_ai("KR", kr_news, kr_radar) if (kr_news or kr_radar) else []
+    us_sigs = analyze_with_ai("US", us_news, us_radar) if (us_news or us_radar) else []
+    print(f"[AI_SIGS] KR={len(kr_sigs)} US={len(us_sigs)}")
+
+    # 기록 + 적재
+    for sig in (kr_sigs + us_sigs):
+        if not isinstance(sig, dict):
+            continue
+        norm = normalize_signal_market_and_ticker(sig)
+        if not norm:
+            continue
+
+        # 장 닫혀도 기록은 남김
+        log_ai_thought(norm["market"], norm["ticker"], norm["score"],
+                       "SCAN" if ((norm["market"] == "KR" and kr_open) or (norm["market"] == "US" and us_open)) else "PRE-SCAN",
+                       norm["trade_type"], norm["reason"],
+                       source="NEWS+RADAR")
+
+        # 장 닫혀있으면 Pending 적재
+        if norm["market"] == "KR" and not kr_open:
+            enqueue_signal_if_market_closed(norm)
+        if norm["market"] == "US" and not us_open:
+            enqueue_signal_if_market_closed(norm)
+
+    save_state()
+
+    # 손실 한도면 신규매수 중지(청산/관리만)
+    if TODAY_PROFIT_KRW <= MAX_DAILY_LOSS_KRW:
+        print("🚨 일일 손실 한도 초과 → 신규 매수 중지(관리만)")
+        return
+
+    # 시장 열리면 Pending 먼저 처리 + 이번 사이클 시그널도 처리
+    if kr_open:
+        pend = pop_pending_for_market("KR", 10)
+        execute_signals("KR", pend + [normalize_signal_market_and_ticker(s) for s in kr_sigs if isinstance(s, dict)])
+    if us_open:
+        pend = pop_pending_for_market("US", 10)
+        execute_signals("US", pend + [normalize_signal_market_and_ticker(s) for s in us_sigs if isinstance(s, dict)])
+
+def execute_signals(market: str, sig_list):
+    # None 제거/정규화
+    norms = []
+    for s in sig_list:
+        if not s:
+            continue
+        if isinstance(s, dict) and "market" in s and "ticker" in s:
+            norms.append(s)
+
+    norms.sort(key=lambda x: x.get("score", 0), reverse=True)
+    obs_inc("EXECUTE_IN", len(norms))
+
+    BUY_SCORE_MIN = 82  # 디버그 단계: 82~85 권장 (안정화 후 88~92로 상향)
+
+    for norm in norms[:8]:
+        obs_inc("CANDIDATE_SEEN")
+
+        m = norm["market"]
+        if m != market:
+            obs_drop("BLOCKED_MARKET_MISMATCH", m, norm.get("ticker"), norm.get("score"))
+            continue
+
+        ticker = norm["ticker"]
+        score = norm.get("score", 0)
+        reason = norm.get("reason", "")
+        ttype = norm.get("trade_type", "SWING")
+        exch = norm.get("exch")
+
+        # 1) 최소 점수 컷
+        if score < 80:
+            obs_drop("BLOCKED_SCORE_LT80", m, ticker, score)
+            continue
+
+        # 2) 포지션 한도
+        if ticker not in PORTFOLIO and len(PORTFOLIO) >= MAX_POSITIONS:
+            obs_drop("BLOCKED_MAX_POSITIONS", m, ticker, score, {"pos": len(PORTFOLIO)})
+            continue
+
+        # 3) 기술분석
+        tech = analyze_technicals(m, ticker)
+        if not tech:
+            obs_drop("BLOCKED_TECH_NONE", m, ticker, score)
+            continue
+        obs_inc("TECH_OK")
+
+        # -------------------------
+        # (V33.1 병목 해결) OB 하드필터 제거 -> 소프트 스코어화
+        # -------------------------
+        soft_score = float(score)
+
+        in_ob = bool(tech.get("in_ob"))
+        rsi = tech.get("rsi")
+
+        # OB: 가점/감점
+        soft_score += 8 if in_ob else -6
+
+        # RSI 과열 약간 감점(너무 강하게 하지 말 것)
+        if isinstance(rsi, (int, float)) and rsi > 78:
+            soft_score -= 8
+
+        if soft_score < BUY_SCORE_MIN:
+            obs_drop("BLOCKED_SOFT_SCORE", m, ticker, score, {"soft": soft_score, "in_ob": in_ob, "rsi": rsi})
+            continue
+        obs_inc("SCORE_OK")
+
+        # 4) 가격 교차검증
+        px, yf_p, kis_p, gap = get_price_hybrid(m, ticker, exch)
+        if px is None:
+            obs_drop("BLOCKED_PX_NONE_HARD_GUARD", m, ticker, score, {"yf": yf_p, "kis": kis_p, "gap": gap})
+            log_ai_thought(m, ticker, score, "SKIP", ttype, reason,
+                           source="LATENCY_GUARD", yf_price=yf_p, kis_price=kis_p, gap=gap,
+                           note="괴리 과대(HARD) → 주문 스킵")
+            continue
+        obs_inc("PX_OK")
+
+        # 시트 로그(결정 근거 남기기)
+        log_ai_thought(
+            m, ticker, soft_score, "TRADE-CHECK", ttype, reason,
+            source="HYBRID_PRICE", yf_price=yf_p, kis_price=kis_p, gap=gap,
+            note=f"soft_score={soft_score} | in_ob={in_ob} | rsi={rsi}"
+        )
+
+        # 5) BUY_TRIGGER
+        obs_inc("BUY_TRIGGER")
+        print(f"🚀 BUY_TRIGGER: m={m} t={ticker} score={score} soft={soft_score:.1f} px={px} in_ob={in_ob} rsi={rsi} gap={gap}")
+
+        # (책 반영) 비례배분 + (US) 변동성 타겟팅
+        amt = calc_amount_proportional(soft_score, m)
+
+        place_order_scaled(
+            m, ticker, "BUY", px, exch=exch,
+            strategy=f"AI(S{int(soft_score)})",
+            reason=f"{reason} | SEL:AI | SIZ:PROP | TIM:OB{int(in_ob)} RSI{int(rsi) if rsi else ''} GAP{round(gap*100,2) if gap else ''}",
+            base_amount=amt,
+            trade_type=ttype
+        )
+
+    obs_maybe_print()
+
+# ==============================================================================
+# [15] 실행
+# ==============================================================================
+if __name__ == "__main__":
+    print(f"🔥 {VERSION} 가동 시작 (KIS_ENV={KIS_ENV}, DRY_RUN={DRY_RUN})")
+
+    initialize_sheet()
+    load_ticker_config()  # ✅ Ticker_Info 시트에서 매매 파라미터 로딩
+    load_kr_tickers()
+    load_state()
+
+    # 스케줄
+    schedule.every(2).minutes.do(main_engine_cycle)
+    try:
+        main_engine_cycle()  # BOOT_RUN_GUARDED
+    except Exception as e:
+        print(f"⚠️ BOOT_RUN 실패: {e}")
+    schedule.every(1).minutes.do(manage_positions_cycle)
+    schedule.every(5).minutes.do(save_state)
+
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print("🛑 수동 종료 요청")
+            save_state()
+            break
+        except Exception as e:
+            print(f"⚠️ 메인 루프 에러: {e}")
+            send_telegram(f"⚠️ 메인 루프 에러 발생: {e}")
+            time.sleep(5)
