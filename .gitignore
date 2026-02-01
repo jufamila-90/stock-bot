@@ -1,6 +1,22 @@
+# secrets / local config
+.env
+service_account.json
+bot_state.json
+*.pem
+*.key
+
+# logs
 *.log
 updater.log
 bot_errors.log
-*.log
-updater.log
-bot_errors.log
+
+# python caches
+__pycache__/
+*.pyc
+
+# venv
+venv/
+.venv/
+
+# OS
+.DS_Store
