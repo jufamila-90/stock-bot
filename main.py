@@ -266,7 +266,11 @@ def calc_amount_proportional(soft_score: float, market: str):
 # ==============================================================================
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash-exp") if GEMINI_KEY else None
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+model = genai.GenerativeModel(GEMINI_MODEL) if GEMINI_KEY else None
+if model:
+    print(f"✅ Gemini Model Initialized: {GEMINI_MODEL}")
 
 # ==============================================================================
 # [1] 유틸

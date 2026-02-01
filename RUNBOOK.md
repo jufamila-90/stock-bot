@@ -48,6 +48,7 @@ SHEET_HEARTBEAT_SEC=180
 
 # --- GEMINI (Optional) ---
 GEMINI_KEY=AIzaSy...
+GEMINI_MODEL=gemini-2.5-flash  # (Optional) Defaults to gemini-2.5-flash
 
 # --- KIS (한국투자증권) ---
 KIS_APP_KEY=...
