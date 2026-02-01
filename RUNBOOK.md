@@ -88,3 +88,29 @@ KIS_ENV=VIRTUAL  # 또는 REAL
 rm bot_state.json
 ./venv/bin/python main.py
 ```
+
+## 6. 자동화 배포 (Deployment)
+
+`scripts/deploy.sh`를 사용하면 코드 푸시, VM 업데이트, 실행 검증, 재시작이 한 번에 처리됩니다.
+
+### 사용법 (Local)
+```bash
+./scripts/deploy.sh
+```
+
+### 작동 원리
+1. **Local**: `git push`로 로컬 변경사항 업로드.
+2. **VM**:
+   - `git pull` & `pip install` (코드/의존성 갱신)
+   - `timeout 30s main.py`로 실행 테스트 (에러 발생 시 중단)
+   - 테스트 통과 시 `scripts/restart_bot.sh` 실행
+3. **Restart**:
+   - `tmux` 세션(`stock-bot`)을 강제 종료 후 재생성.
+   - 로그는 `bot.log` 및 `tmux` 세션 내에 기록됨.
+
+### 모니터링
+배포 후 VM에서 로그를 보려면:
+```bash
+# 로컬에서 바로 접속하여 로그 보기 (키체인 사용)
+ssh -i ~/.ssh/google_compute_engine juhyeon@34.16.2.223 "sudo -u jufamila tmux attach -t stock-bot"
+```
