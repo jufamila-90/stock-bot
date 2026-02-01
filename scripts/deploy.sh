@@ -7,7 +7,7 @@ VM_USER="juhyeon"  # SSH 접속용 계정 (키 등록됨)
 TARGET_USER="jufamila" # 실제 봇 구동 계정
 VM_DIR="/home/$TARGET_USER/stock-bot"
 SSH_KEY="~/.ssh/google_compute_engine"
-SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no $VM_USER@$VM_HOST output"
+SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no $VM_USER@$VM_HOST"
 
 # Helper to run command as target user
 run_as_target() {
