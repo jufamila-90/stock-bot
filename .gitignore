@@ -20,3 +20,11 @@ venv/
 
 # OS
 .DS_Store
+
+# snapshots / backups
+.env.snap_*
+*.bak_*
+
+# python bytecode (혹시 빠졌을 때 대비)
+*.pyc
+__pycache__/
