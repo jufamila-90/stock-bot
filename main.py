@@ -1838,8 +1838,9 @@ def main_engine_cycle():
             enqueue_signal_if_market_closed(norm)
 
     # ✅ Looker Studio Snapshot 업데이트 (매 사이클 갱신)
-    if PORTFOLIO:  # 포트폴리오가 있을 때만 갱신
-        update_looker_data()
+    # ✅ Looker Studio Snapshot 업데이트 (매 사이클 갱신)
+    # 포트폴리오 비어있어도 헤더 생성을 위해 실행
+    update_looker_data()
 
     save_state()
 
