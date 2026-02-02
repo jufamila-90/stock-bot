@@ -509,6 +509,9 @@ def log_trade_to_sheet(ts, ticker, market, exch, side, price, qty, pnl, strategy
         # ✅ Dashboard 지표 업데이트
         update_dashboard_metrics()
         
+        # ✅ Looker Studio 데이터 업데이트
+        update_looker_data()
+        
         print(f"📝 주식거래_RAW 로깅: {stock_name}({formatted_ticker}) {side} {qty}주 @{price}")
 
     except Exception as e:
@@ -707,6 +710,81 @@ def update_dashboard_metrics():
     except Exception as e:
         print(f"⚠️ update_dashboard_metrics 에러: {e}")
 
+
+# ==============================================================================
+# Looker Studio Integration
+# ==============================================================================
+WS_LOOKER = "Looker_Data"
+
+def update_looker_data():
+    """
+    Looker Studio용 Flat Data 업로드:
+    - 매번 시트를 클리어하고 현재 포트폴리오를 새로 씀 (Snapshot)
+    - 컬럼: [Date, Ticker, Name, Qty, AvgPrice, CurPrice, MarketValue, PnL, PnL_Pct, Market, FX]
+    """
+    if not GSHEET:
+        return
+
+    try:
+        # Check if tab exists, else create
+        try:
+            ws = GSHEET.worksheet(WS_LOOKER)
+        except:
+            ws = GSHEET.add_worksheet(title=WS_LOOKER, rows=100, cols=15)
+            print(f"✅ {WS_LOOKER} 탭 생성 완료")
+
+        ws.clear()
+        
+        headers = ["Date", "Ticker", "Name", "Qty", "AvgPrice", "CurPrice", "MarketValue", "PnL", "PnL_Pct", "Market", "FX"]
+        rows = [headers]
+        
+        now_str = now_kr().strftime("%Y-%m-%d %H:%M:%S")
+        
+        for ticker, info in PORTFOLIO.items():
+            qty = info.get('qty', 0)
+            avg_price = info.get('avg_price', 0)
+            market = info.get('market', 'KR')
+            
+            # 현재가 추정 (kis_price가 있으면 쓰고, 없으면 평단가로 fallback)
+            cur_price = info.get('current_price', avg_price) # TODO: 현재가 갱신 로직 필요 시 보강
+            
+            fx = EXCHANGE_RATE if market == 'US' else 1.0
+            
+            # 평가액
+            market_value_krw = qty * cur_price * fx
+            invested_krw = qty * avg_price * fx
+            
+            pnl_krw = market_value_krw - invested_krw
+            pnl_pct = (pnl_krw / invested_krw * 100) if invested_krw > 0 else 0
+            
+            # 종목명 (KR_TICKER_MAP 역검색 또는 info 내 저장된 이름)
+            name = ticker
+            if market == 'KR':
+                clean = ticker.replace(".KS", "").replace(".KQ", "")
+                # (생략: 역검색은 비용이 큼. info에 stock_name이 있다면 좋음)
+                # 여기선 간단히 처리
+            
+            row = [
+                now_str,
+                ticker,
+                name,
+                qty,
+                avg_price,
+                cur_price,
+                market_value_krw,
+                pnl_krw,
+                pnl_pct,
+                market,
+                fx
+            ]
+            rows.append(row)
+            
+        # 한 번에 업데이트 (Efficient)
+        ws.update(f'A1:K{len(rows)}', rows)
+        print(f"✅ Looker Data Updated ({len(rows)-1} items)")
+        
+    except Exception as e:
+        print(f"⚠️ update_looker_data 에러: {e}")
 
 # ==============================================================================
 # [4] 티커 로딩
@@ -1758,6 +1836,10 @@ def main_engine_cycle():
             enqueue_signal_if_market_closed(norm)
         if norm["market"] == "US" and not us_open:
             enqueue_signal_if_market_closed(norm)
+
+    # ✅ Looker Studio Snapshot 업데이트 (매 사이클 갱신)
+    if PORTFOLIO:  # 포트폴리오가 있을 때만 갱신
+        update_looker_data()
 
     save_state()
 
